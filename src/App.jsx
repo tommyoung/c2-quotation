@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, forwardRef } from 'react'
 import * as XLSX from 'xlsx'
-import DEFAULT_PRICING from './pricing.js'
+import DEFAULT_PRICING, { getServiceKey } from './pricing.js'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const MONTHS     = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC']
@@ -11,6 +11,7 @@ const PREP_KEY   = 'c2_preparers_v1'
 const AUTH_KEY   = 'c2_team_auth'
 const LOG_KEY    = 'c2_quotation_log'
 const C2_LOGO    = 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQahQ15JxgwEv7pQYAJZjVwRFgrWarY7nLEL2AEojc3WA&s=10'
+const CATS       = ['PR','Content','KOL','Video','Paid Ads']
 
 const DEFAULT_PREPARERS = [
   { name:'Tommy Prayoga',  title:'Head of Agency' },
@@ -37,10 +38,13 @@ function autoQuoteNo(dateStr, code) {
   return `001/${MONTHS[d.getMonth()]}/${(code||'CLT').toUpperCase().replace(/\s+/g,'').slice(0,6)}/${d.getFullYear()}`
 }
 function fmtPriceAdmin(price, cur) {
+  if (price==null || price==='') return ''
   return cur==='IDR' ? Math.round(price).toLocaleString('id-ID') : price.toString()
 }
 function parseAdminPrice(str) {
-  return Number(String(str).replace(/\./g,'').replace(/,/g,'.')) || 0
+  if (str==null || String(str).trim()==='') return null
+  const n = Number(String(str).replace(/\./g,'').replace(/,/g,'.'))
+  return isNaN(n) ? null : n
 }
 function calcGrand(sub, disc, cur) {
   const net = sub-(disc||0); return cur==='IDR' ? net/0.98 : net
@@ -110,6 +114,7 @@ const bBl={cursor:'pointer',border:'none',borderRadius:5,padding:'7px 14px',font
 const bPr={cursor:'pointer',border:'1px solid #ccc',borderRadius:5,padding:'7px 14px',fontSize:12,fontFamily:'inherit',background:'#fff',color:'#333'}
 const bRd={cursor:'pointer',border:'1px solid #5a1a1a',borderRadius:5,padding:'6px 12px',fontSize:12,fontFamily:'inherit',background:'transparent',color:'#f88'}
 const bOr={cursor:'pointer',border:'none',borderRadius:5,padding:'7px 14px',fontSize:12,fontFamily:'inherit',background:'#3a2200',color:'#f5a623',fontWeight:600}
+const bPu={cursor:'pointer',border:'none',borderRadius:5,padding:'7px 14px',fontSize:12,fontFamily:'inherit',background:'#2a1a4a',color:'#c0a0f0',fontWeight:600}
 
 function Inp({label,...p}) {
   return <div style={S.field}>
@@ -156,7 +161,7 @@ export default function App() {
   const [custId,setCustId]=useState('')
   const [period,setPeriod]=useState('')
   const [date,setDate]=useState(new Date().toISOString().slice(0,10))
-  const [prepIdx,setPrepIdx]=useState(0)
+  const [prepIdxs,setPrepIdxs]=useState([0])
   const [markets,setMarkets]=useState([])
   const [brief,setBrief]=useState('')
   const [discPct,setDiscPct]=useState(0)
@@ -170,21 +175,29 @@ export default function App() {
   const [error,setError]=useState('')
   const [editMode,setEditMode]=useState(false)
 
+  // AI clarification (two-pass generation)
+  const [clarifyQuestions,setClarifyQuestions]=useState(null)
+  const [clarifyAnswers,setClarifyAnswers]=useState({})
+  const [clarifyContext,setClarifyContext]=useState('')
+
   // Log viewer
   const [viewingLog,setViewingLog]=useState(null)
   const [logPdfBusy,setLogPdfBusy]=useState(false)
+  const [logSearch,setLogSearch]=useState('')
 
   // Admin
   const [adminInput,setAdminInput]=useState('')
   const [adminAuth,setAdminAuth]=useState(false)
   const [adminTab,setAdminTab]=useState('pricing')
   const [adminMkt,setAdminMkt]=useState('indonesia')
+  const [adminCat,setAdminCat]=useState('PR')
   const [editRows,setEditRows]=useState([])
   const [editPreparers,setEditPreparers]=useState(DEFAULT_PREPARERS)
   const [newPrepName,setNewPrepName]=useState('')
   const [newPrepTitle,setNewPrepTitle]=useState('')
   const [log,setLog]=useState([])
-  const [newSvc,setNewSvc]=useState({name:'',cat:'PR',sub:'',price:'',unit:'campaign',note:''})
+  const [newSvc,setNewSvc]=useState({name:'',cat:'PR',sub:'',price:'',unit:'campaign',note:'',internalNotes:''})
+  const [syncMsg,setSyncMsg]=useState('')
 
   useEffect(()=>{
     try{
@@ -201,7 +214,7 @@ export default function App() {
   function savePreparers(list){ setPreparers(list); try{localStorage.setItem(PREP_KEY,JSON.stringify(list))}catch{} }
 
   function addToLog(q,overrideQuoteNo){
-    const prep=preparers[prepIdx]||preparers[0]
+    const signers=(prepIdxs.length?prepIdxs:[0]).map(i=>preparers[i]).filter(Boolean)
     const entry={
       id:Date.now().toString(),
       quoteNo:overrideQuoteNo||quoteNo,
@@ -209,10 +222,11 @@ export default function App() {
       custId:custId||'—',
       period:period||'—',
       date,
-      preparedBy:prep.name,
-      prepTitle:prep.title,
-      prepIdx,
+      preparedBy:signers.map(s=>s.name).join(' & ')||'—',
+      prepTitle:signers.map(s=>s.title).join(' / ')||'—',
+      signers,
       markets:markets.map(m=>db[m]?.label||m),
+      marketKeys:markets,
       currency:q.currency,
       total:Math.round(q.grand),
       createdAt:new Date().toISOString(),
@@ -227,6 +241,7 @@ export default function App() {
   function handleTeamAuth(){localStorage.setItem(AUTH_KEY,'true');setTeamAuth(true)}
   const currency=markets.length===1&&markets[0]==='indonesia'?'IDR':'USD'
   function toggleMarket(m){setMarkets(prev=>prev.includes(m)?prev.filter(x=>x!==m):[...prev,m])}
+  function togglePrep(i){setPrepIdxs(prev=>prev.includes(i)?(prev.length>1?prev.filter(x=>x!==i):prev):[...prev,i])}
 
   // ── Inline editing helpers ────────────────────────────────────────────────
   function updateLineItem(idx,field,val){
@@ -261,6 +276,11 @@ export default function App() {
     })
   }
 
+  function updatePaymentTerms(val){ setQuot(prev=>prev?({...prev,paymentTerms:val}):prev) }
+  function updateNote(i,val){ setQuot(prev=>{ if(!prev)return prev; const notes=[...(prev.notes||[])]; notes[i]=val; return {...prev,notes} }) }
+  function addNote(){ setQuot(prev=>prev?({...prev,notes:[...(prev.notes||[]),'New note']}):prev) }
+  function deleteNote(i){ setQuot(prev=>{ if(!prev)return prev; const notes=(prev.notes||[]).filter((_,idx)=>idx!==i); return {...prev,notes} }) }
+
   function saveRevision(){
     // Save the edited quotation back to the log as a new revision entry
     if(!quot)return
@@ -268,15 +288,19 @@ export default function App() {
     alert('✓ Revision saved to log.')
   }
 
-  // ── Generate ──────────────────────────────────────────────────────────────
-  async function generate(){
-    if(!brief.trim()){setError('Enter a brief first.');return}
-    if(markets.length===0){setError('Select at least one market.');return}
-    setLoading(true);setError('');setQuot(null);setEditMode(false)
+  // ── Generate (two-pass: AI may ask clarifying questions before finalizing) ──
+  async function runGeneration(userMsgOverride, isFollowUp){
+    setLoading(true);setError('')
+    if(!isFollowUp){ setQuot(null);setEditMode(false);setClarifyQuestions(null);setClarifyAnswers({}) }
 
     const pricingRef=markets.map(m=>{
       const mkt=db[m];if(!mkt)return''
-      return `=== ${mkt.label} (${mkt.currency}) ===\n`+mkt.services.map(s=>`• ${s.name}: ${s.price.toLocaleString()} ${mkt.currency}/${s.unit}${s.note?' ('+s.note+')':''}`).join('\n')
+      const priced=(mkt.services||[]).filter(s=>s.price!=null && s.price!=='')
+      return `=== ${mkt.label} (${mkt.currency}) ===\n`+priced.map(s=>
+        `• ${s.name}: ${s.price.toLocaleString()} ${mkt.currency}/${s.unit}`+
+        (s.note?` (client-facing note: ${s.note})`:'')+
+        (s.internalNotes?` [internal context, never show to client: ${s.internalNotes}]`:'')
+      ).join('\n')
     }).join('\n\n')
 
     const systemPrompt=`You are a senior account director at Content Collision (C2), a B2B PR and content marketing agency in Southeast Asia.
@@ -288,33 +312,64 @@ ${pricingRef}
 
 CRITICAL RULES:
 - Currency: ${currency}
+- If the brief explicitly states a custom price for a specific service, USE THAT PRICE as unitPrice instead of the database default, and mention in that item's "notes" that it is a custom quoted rate.
+- If the brief specifies a volume or quantity target (e.g. "10 coverages/month" vs. a database baseline of 5), SCALE unitPrice × qty accordingly so the total reflects the stated volume. Two different stated quantities must never produce the same total for the same service.
 - RETAINER / MANAGEMENT / CAMPAIGN FEES: qty = 1. unitPrice = the full rate. Never multiply by coverage count.
 - COVERAGE (per coverage obtained): qty = number of coverages. unitPrice = per-coverage rate.
 - NEVER include both a PR Campaign package AND separate coverage lines for the same campaign. Choose one.
-- Media invite: qty = number of media outlets. unitPrice = per-media rate.
+- Media invite: qty = number of media outlets, not number of events.
 - DP: 50% for IDR, 30% for USD.
 - Sequential numbers (1, 2, 3...) — no sub-numbering like 1.1.
 - Each item must have a "category" field: "Public Relations", "Content Marketing", "KOL / Influencer", "Video Production", or "Paid Advertising".
-- Descriptions: 2–3 lines of clear scope.
+- Descriptions: 2–3 lines of clear scope, and must name the market/country the service is for (e.g. "for the Indonesia market", "targeting Singapore media").
 
-RETURN VALID JSON ONLY:
-{"lineItems":[{"no":1,"category":"Public Relations","service":"PR Campaign – National Media","description":"End-to-end PR campaign targeting Tier 1 national media. Includes strategy, release creation, media outreach, and monthly reporting.","qty":1,"unit":"campaign","unitPrice":20000000,"total":20000000,"notes":"Performance-based"}],"subtotal":20000000,"dpPct":50,"paymentTerms":"50% down payment when project begins, remaining 50% upon completion","notes":["Press releases created for any campaign are provided free of charge."]}`
+IF THE BRIEF IS GENUINELY AMBIGUOUS — e.g. a volume/price change mentioned without a clear number, or unclear which line item a stated price applies to — do not guess. Instead return ONLY:
+{"needsClarification":true,"questions":["Specific question 1","Specific question 2"]}
+Ask at most 3 sharp, specific questions. Do not ask something you can reasonably infer from context — only ask when a guess would materially change the price.
+
+OTHERWISE RETURN VALID JSON ONLY, IN THIS EXACT SHAPE:
+{"lineItems":[{"no":1,"category":"Public Relations","service":"PR Campaign – National Media","description":"2-3 line scope mentioning the market","qty":1,"unit":"campaign","unitPrice":20000000,"total":20000000,"notes":"Performance-based"}],"subtotal":20000000,"dpPct":50,"paymentTerms":"50% down payment when project begins, remaining 50% upon completion","notes":["Press releases created for any campaign are provided free of charge."]}`
+
+    const baseUserMsg=`Client: ${clientName||'TBD'}\nPeriod: ${period||'TBD'}\nMarkets: ${markets.map(m=>db[m]?.label||m).join(', ')}\n\nBrief:\n${brief}`
+    const userContent=userMsgOverride||baseUserMsg
 
     try{
       const res=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({systemPrompt,messages:[{role:'user',content:`Client: ${clientName||'TBD'}\nPeriod: ${period||'TBD'}\nMarkets: ${markets.map(m=>db[m]?.label||m).join(', ')}\n\nBrief:\n${brief}`}]})})
+        body:JSON.stringify({systemPrompt,messages:[{role:'user',content:userContent}]})})
       const data=await res.json()
       if(data.error)throw new Error(data.error)
       const raw=data.choices?.[0]?.message?.content
       if(!raw)throw new Error('No response from OpenAI. Check your API key.')
       const parsed=JSON.parse(raw)
+
+      if(parsed.needsClarification){
+        setClarifyQuestions((parsed.questions||[]).slice(0,3))
+        setClarifyContext(userContent)
+        setLoading(false)
+        return
+      }
+
       const discAmt=discPct>0?Math.round(parsed.subtotal*discPct/100):0
       const discTxt=discPct>0?`${discPct}% discount${discNote?' — '+discNote:''}`:''
       const q=recalcQuot({...parsed,currency,discount:discAmt,discountNote:discTxt})
       setQuot(q)
       addToLog(q)
+      setClarifyQuestions(null);setClarifyAnswers({});setClarifyContext('')
     }catch(e){setError('Generation failed: '+e.message)}
     setLoading(false)
+  }
+
+  function generate(){
+    if(!brief.trim()){setError('Enter a brief first.');return}
+    if(markets.length===0){setError('Select at least one market.');return}
+    runGeneration(null,false)
+  }
+
+  function submitClarification(){
+    if(!clarifyQuestions)return
+    const qa=clarifyQuestions.map((q,i)=>`Q: ${q}\nA: ${clarifyAnswers[i]||'(no answer given)'}`).join('\n\n')
+    const followUp=`${clarifyContext}\n\nClarification follow-up:\n${qa}\n\nIMPORTANT: Provide the final lineItems JSON now. Do not request further clarification.`
+    runGeneration(followUp,true)
   }
 
   // ── PDF / Excel for current quotation ────────────────────────────────────
@@ -326,12 +381,13 @@ RETURN VALID JSON ONLY:
     setPdfBusy(false)
   }
 
-  function buildExcelRows(q,qNo,cl,cId,per,dt,prep){
+  function buildExcelRows(q,qNo,cl,cId,per,dt,preps){
     const cur=q.currency
+    const prepLine=(preps||[]).map(p=>p.name).join(' & ')||'Content Collision'
     const rows=[['CONTENT COLLISION (C2)'],[],
       ['PT Konten Global Adikarya','','','Date:',fmtDate(dt)],
       ['APL Office Tower Lantai 16 Unit 9','','','Quote #:',qNo],
-      ['Jalan Letjen. S. Parman Kav. 28 Jakarta 11470','','','Prepared by:','Content Collision'],
+      ['Jalan Letjen. S. Parman Kav. 28 Jakarta 11470','','','Prepared by:',prepLine],
       ['Phone: +62 812 7765 7773','','','Customer ID:',cId||cl||'—'],
       ['Email: young@contentcollision.co','','','Period:',per||'—'],
       ['NPWP: 82.351.078.9-036.000'],[],
@@ -348,14 +404,17 @@ RETURN VALID JSON ONLY:
     rows.push([],[`*C2 will begin after client pays ${q.dpPct}% down payment.`],[`*${q.paymentTerms}`])
     ;(q.notes||[]).forEach(n=>rows.push([`*${n}`]))
     if(cur==='IDR')rows.push(['*A 2% charge applies for late payments.'])
-    rows.push([],['Quotation Prepared By:'],[],[prep.name],[prep.title],['PT Konten Global Adikarya (C2)'],[fmtDate(dt)])
+    rows.push([],['Quotation Prepared By:'],[])
+    ;(preps&&preps.length?preps:[{name:'Tommy Prayoga',title:'Head of Agency'}]).forEach(p=>{
+      rows.push([p.name],[p.title],['PT Konten Global Adikarya (C2)'],[fmtDate(dt)],[])
+    })
     return rows
   }
 
   function exportExcel(){
     if(!quot)return
-    const prep=preparers[prepIdx]||preparers[0]
-    const rows=buildExcelRows(quot,quoteNo,clientName,custId,period,date,prep)
+    const preps=(prepIdxs.length?prepIdxs:[0]).map(i=>preparers[i]).filter(Boolean)
+    const rows=buildExcelRows(quot,quoteNo,clientName,custId,period,date,preps)
     const ws=XLSX.utils.aoa_to_sheet(rows)
     ws['!cols']=[{wch:6},{wch:55},{wch:8},{wch:22},{wch:22},{wch:34}]
     const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Quotation')
@@ -374,23 +433,48 @@ RETURN VALID JSON ONLY:
   function exportLogExcel(){
     if(!viewingLog?.quotData)return
     const v=viewingLog
-    const prep={name:v.preparedBy,title:v.prepTitle}
-    const rows=buildExcelRows(v.quotData,v.quoteNo,v.clientName,v.custId,v.period,v.date,prep)
+    const preps=v.signers&&v.signers.length?v.signers:[{name:v.preparedBy,title:v.prepTitle}]
+    const rows=buildExcelRows(v.quotData,v.quoteNo,v.clientName,v.custId,v.period,v.date,preps)
     const ws=XLSX.utils.aoa_to_sheet(rows)
     ws['!cols']=[{wch:6},{wch:55},{wch:8},{wch:22},{wch:22},{wch:34}]
     const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Quotation')
     XLSX.writeFile(wb,`C2_Quotation_${v.clientName.replace(/\s+/g,'_')}_${v.date}.xlsx`)
   }
 
+  function loadFromLog(entry){
+    setViewingLog(null)
+    setView('gen')
+    setClientName(entry.clientName==='—'?'':entry.clientName)
+    setCustId(entry.custId==='—'?'':entry.custId)
+    setPeriod(entry.period==='—'?'':entry.period)
+    setDate(entry.date||new Date().toISOString().slice(0,10))
+    setQuoteNo(entry.quoteNo)
+    setBrief('')
+    setError('')
+    if(entry.marketKeys&&entry.marketKeys.length){
+      setMarkets(entry.marketKeys)
+    }else{
+      setError('This is an older log entry saved before market tracking was added — please reselect markets manually if you plan to regenerate.')
+    }
+    if(entry.signers&&entry.signers.length){
+      const idxs=entry.signers.map(s=>preparers.findIndex(p=>p.name===s.name)).filter(i=>i>=0)
+      setPrepIdxs(idxs.length?idxs:[0])
+    }else if(typeof entry.prepIdx==='number'){
+      setPrepIdxs([entry.prepIdx])
+    }
+    setQuot(recalcQuot(entry.quotData))
+    setEditMode(true)
+  }
+
   // ── Admin helpers ─────────────────────────────────────────────────────────
-  function startEditMkt(m){setAdminMkt(m);setEditRows(JSON.parse(JSON.stringify(db[m]?.services||[])))}
+  function startEditMkt(m){setAdminMkt(m);setEditRows(JSON.parse(JSON.stringify(db[m]?.services||[])));setAdminCat('PR')}
   function saveAdminPrices(){const nd={...db,[adminMkt]:{...db[adminMkt],services:editRows}};saveDb(nd);alert('✓ Saved.')}
   function updateRow(i,f,v){setEditRows(r=>{const a=[...r];a[i]={...a[i],[f]:f==='price'?parseAdminPrice(v):v};return a})}
   function deleteRow(i){if(!confirm('Delete this service?'))return;setEditRows(r=>r.filter((_,idx)=>idx!==i))}
   function addService(){
     if(!newSvc.name.trim()||!newSvc.price){alert('Name and price required.');return}
-    const s={id:`c_${Date.now()}`,cat:newSvc.cat,sub:newSvc.sub||newSvc.cat,name:newSvc.name.trim(),price:parseAdminPrice(newSvc.price),unit:newSvc.unit,note:newSvc.note}
-    setEditRows(r=>[...r,s]); setNewSvc({name:'',cat:'PR',sub:'',price:'',unit:'campaign',note:''})
+    const s={id:`c_${Date.now()}`,cat:newSvc.cat,sub:newSvc.sub||newSvc.cat,name:newSvc.name.trim(),price:parseAdminPrice(newSvc.price),unit:newSvc.unit,note:newSvc.note,internalNotes:newSvc.internalNotes||''}
+    setEditRows(r=>[...r,s]); setNewSvc({name:'',cat:newSvc.cat,sub:'',price:'',unit:'campaign',note:'',internalNotes:''})
   }
   function addPreparer(){
     if(!newPrepName.trim())return
@@ -404,10 +488,40 @@ RETURN VALID JSON ONLY:
   function exportConfig(){const bl=new Blob([JSON.stringify(db,null,2)],{type:'application/json'});const u=URL.createObjectURL(bl);const a=document.createElement('a');a.href=u;a.download='c2-pricing.json';a.click();URL.revokeObjectURL(u)}
   function importConfig(e){const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{saveDb(JSON.parse(ev.target.result));startEditMkt(adminMkt);alert('✓ Imported.')}catch{alert('Invalid file.')}};r.readAsText(f)}
 
+  function syncFromIndonesia(){
+    if(adminMkt==='indonesia'){alert('Already viewing Indonesia — nothing to sync.');return}
+    const idServices=db.indonesia.services
+    const existingKeys=new Set(editRows.map(getServiceKey).filter(Boolean))
+    const missing=idServices.filter(s=>s.key&&!existingKeys.has(s.key))
+    if(!missing.length){setSyncMsg('Already in sync — no missing services found.');setTimeout(()=>setSyncMsg(''),4000);return}
+    const newRows=missing.map(s=>({
+      id:`${adminMkt}_sync_${s.key}`,
+      key:s.key,
+      cat:s.cat, sub:s.sub,
+      name:s.name,
+      price:null,
+      unit:s.unit,
+      note:s.note||'',
+      internalNotes:s.internalNotes||'',
+      needsLocalization:true,
+    }))
+    setEditRows(r=>[...r,...newRows])
+    setAdminCat(newRows[0].cat)
+    setSyncMsg(`✓ Added ${newRows.length} service${newRows.length!==1?'s':''} from Indonesia — set a local price for each (highlighted below) before saving.`)
+    setTimeout(()=>setSyncMsg(''),8000)
+  }
+
+  const filteredLog=log.filter(e=>{
+    if(!logSearch.trim())return true
+    const s=logSearch.toLowerCase()
+    return [e.clientName,e.quoteNo,e.preparedBy,e.custId].some(v=>(v||'').toLowerCase().includes(s))
+  })
+
   // ─────────────────────────────────────────────────────────────────────────
   if(!teamAuth)return <TeamGate onAuth={handleTeamAuth}/>
 
-  const currentPrep=preparers[prepIdx]||preparers[0]
+  const currentPreps=(prepIdxs.length?prepIdxs:[0]).map(i=>preparers[i]).filter(Boolean)
+  const visibleRows=editRows.map((s,i)=>({...s,_origIdx:i})).filter(s=>s.cat===adminCat)
 
   return <div style={S.app}>
     <style>{`
@@ -440,10 +554,10 @@ RETURN VALID JSON ONLY:
         </div>
         <Inp label="Quote Number" value={quoteNo} onChange={e=>setQuoteNo(e.target.value)}/>
         <div style={S.field}>
-          <label style={S.lbl}>Prepared / Signed By</label>
-          <select value={prepIdx} onChange={e=>setPrepIdx(Number(e.target.value))} style={{background:'#1a1a1a',color:'#e0e0e0',border:'1px solid #2e2e2e',borderRadius:4,padding:'7px 10px',fontSize:13,width:'100%',outline:'none',fontFamily:'inherit'}}>
-            {preparers.map((p,i)=><option key={i} value={i}>{p.name} — {p.title}</option>)}
-          </select>
+          <label style={S.lbl}>Signed By (select one or more)</label>
+          <div>{preparers.map((p,i)=>(
+            <span key={i} style={{...S.chip,...(prepIdxs.includes(i)?S.chipA:{})}} onClick={()=>togglePrep(i)}>{p.name}</span>
+          ))}</div>
         </div>
         <hr style={S.hr}/>
         <div style={S.sec}>MARKETS</div>
@@ -463,7 +577,23 @@ RETURN VALID JSON ONLY:
           {loading?'⏳  Generating…':'✦  Generate Quotation'}
         </button>
         {error&&<div style={{marginTop:12,padding:12,background:'#2a0d0d',borderRadius:6,color:'#f88',fontSize:12,lineHeight:1.5}}>{error}</div>}
-        {quot&&<div style={{marginTop:12,padding:10,background:'#0a1a0a',borderRadius:6,fontSize:11,color:'#7fd9a0',lineHeight:1.6}}>
+
+        {clarifyQuestions&&clarifyQuestions.length>0&&<div style={{marginTop:14,padding:14,background:'#2a2200',borderRadius:8,border:'1px solid #4a3a00'}}>
+          <div style={{fontSize:12,fontWeight:700,color:'#f5a623',marginBottom:10}}>⚠ A few things need clarifying before pricing this accurately:</div>
+          {clarifyQuestions.map((q,i)=>(
+            <div key={i} style={{marginBottom:10}}>
+              <label style={{...S.lbl,color:'#ccc'}}>{q}</label>
+              <input value={clarifyAnswers[i]||''} onChange={e=>setClarifyAnswers(a=>({...a,[i]:e.target.value}))}
+                onKeyDown={e=>e.key==='Enter'&&submitClarification()}
+                style={{background:'#1a1a1a',color:'#e0e0e0',border:'1px solid #3a3a3a',borderRadius:4,padding:'7px 10px',fontSize:13,width:'100%',boxSizing:'border-box',outline:'none',fontFamily:'inherit'}}/>
+            </div>
+          ))}
+          <button style={{...bP,width:'100%',padding:10,fontSize:13}} onClick={submitClarification} disabled={loading}>
+            {loading?'⏳ Generating…':'✦ Continue Generating'}
+          </button>
+        </div>}
+
+        {quot&&!clarifyQuestions&&<div style={{marginTop:12,padding:10,background:'#0a1a0a',borderRadius:6,fontSize:11,color:'#7fd9a0',lineHeight:1.6}}>
           ✓ Quotation generated. You can <strong>edit it directly</strong> using the Edit Mode button in the toolbar, then download.
         </div>}
       </div>
@@ -472,9 +602,10 @@ RETURN VALID JSON ONLY:
       <div className="print-area" style={S.right}>
         {!quot
           ? <div style={S.empty}><div style={{fontSize:48}}>📄</div><div>Fill in the brief and click Generate</div><div style={{fontSize:12,color:'#bbb'}}>You can edit any line item after generation without regenerating.</div></div>
-          : <QuotationDoc ref={quotDocRef} quot={quot} clientName={clientName} custId={custId} period={period} date={date} quoteNo={quoteNo} prep={currentPrep}
+          : <QuotationDoc ref={quotDocRef} quot={quot} clientName={clientName} custId={custId} period={period} date={date} quoteNo={quoteNo} preps={currentPreps}
               editMode={editMode} onToggleEdit={()=>setEditMode(e=>!e)}
               onUpdateItem={updateLineItem} onDeleteItem={deleteLineItem} onAddItem={addLineItem}
+              onUpdatePaymentTerms={updatePaymentTerms} onUpdateNote={updateNote} onAddNote={addNote} onDeleteNote={deleteNote}
               onSaveRevision={saveRevision}
               onPDF={exportPDF} onExcel={exportExcel} onPrint={()=>window.print()} pdfBusy={pdfBusy}/>
         }
@@ -501,61 +632,95 @@ RETURN VALID JSON ONLY:
 
           {/* Pricing */}
           {adminTab==='pricing'&&<>
-            <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
+            <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap',alignItems:'center'}}>
               <button style={bP} onClick={saveAdminPrices}>💾 Save Changes</button>
+              {adminMkt!=='indonesia'&&<button style={bPu} onClick={syncFromIndonesia}>🔄 Sync from Indonesia</button>}
               <button style={bG} onClick={exportConfig}>⬇ Export Config</button>
               <label style={{...bG,cursor:'pointer'}}>⬆ Import Config<input type="file" accept=".json" style={{display:'none'}} onChange={importConfig}/></label>
               <button style={bRd} onClick={()=>{if(confirm('Reset all prices?')){saveDb(DEFAULT_PRICING);startEditMkt(adminMkt)}}}>↩ Reset Defaults</button>
+              {syncMsg&&<span style={{fontSize:12,color:'#c0a0f0'}}>{syncMsg}</span>}
             </div>
-            <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:20}}>
+            <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:12}}>
               {Object.entries(db).map(([k,m])=>(
                 <button key={k} style={adminMkt===k?{...bP,padding:'5px 13px',fontSize:12}:{...bG,padding:'5px 13px',fontSize:12}} onClick={()=>startEditMkt(k)}>{m.label}</button>
               ))}
             </div>
-            <div style={{overflowX:'auto'}}>
+            <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:20,paddingTop:12,borderTop:'1px solid #1c1c1c'}}>
+              {CATS.map(c=>{
+                const count=editRows.filter(r=>r.cat===c).length
+                return <button key={c} style={adminCat===c?{...bOr,padding:'5px 13px',fontSize:12}:{...bG,padding:'5px 13px',fontSize:12}} onClick={()=>setAdminCat(c)}>{c} ({count})</button>
+              })}
+            </div>
+            {visibleRows.length===0
+              ?<div style={{padding:'30px 0',textAlign:'center',color:'#666',fontSize:13}}>
+                  No {adminCat} services for {db[adminMkt]?.label} yet.
+                  {adminMkt!=='indonesia'&&<> Try <strong style={{color:'#c0a0f0'}}>🔄 Sync from Indonesia</strong> above to pull in Indonesia's {adminCat} services as a starting point.</>}
+                </div>
+              :<div style={{overflowX:'auto'}}>
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                 <thead><tr style={{background:'#111'}}>
-                  {['Service Name','Category','Sub','Unit',`Price (${db[adminMkt]?.currency})`,'Note',''].map(h=>(
+                  {['Service Name','Sub','Unit',`Price (${db[adminMkt]?.currency})`,'Client-facing note','Internal notes (AI context only)',''].map(h=>(
                     <th key={h} style={{padding:'8px 10px',textAlign:'left',color:'#888',fontWeight:600,borderBottom:'1px solid #222',whiteSpace:'nowrap'}}>{h}</th>
                   ))}
                 </tr></thead>
-                <tbody>{editRows.map((s,i)=>(
-                  <tr key={s.id||i} style={{background:i%2===0?'#0f0f0f':'#131313',borderBottom:'1px solid #1a1a1a'}}>
-                    {[['name',180],['cat',90],['sub',90],['unit',80]].map(([f,w])=>(
-                      <td key={f} style={{padding:'6px 8px'}}>
-                        <input value={s[f]||''} onChange={e=>updateRow(i,f,e.target.value)}
-                          style={{background:'#1e1e1e',color:'#ddd',border:'1px solid #2a2a2a',borderRadius:3,padding:'4px 7px',fontSize:12,width:w,outline:'none',fontFamily:'inherit'}}/>
-                      </td>
-                    ))}
+                <tbody>{visibleRows.map((s)=>{
+                  const i=s._origIdx
+                  const needsPrice=s.price==null||s.price===''
+                  return (
+                  <tr key={s.id||i} style={{background:needsPrice?'#2a2000':(i%2===0?'#0f0f0f':'#131313'),borderBottom:'1px solid #1a1a1a'}}>
+                    <td style={{padding:'6px 8px',minWidth:220}}>
+                      <input value={s.name||''} onChange={e=>updateRow(i,'name',e.target.value)}
+                        style={{background:'#1e1e1e',color:'#ddd',border:'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:12,width:'100%',outline:'none',fontFamily:'inherit'}}/>
+                    </td>
+                    <td style={{padding:'6px 8px'}}>
+                      <input value={s.sub||''} onChange={e=>updateRow(i,'sub',e.target.value)}
+                        style={{background:'#1e1e1e',color:'#ddd',border:'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:12,width:100,outline:'none',fontFamily:'inherit'}}/>
+                    </td>
+                    <td style={{padding:'6px 8px'}}>
+                      <input value={s.unit||''} onChange={e=>updateRow(i,'unit',e.target.value)}
+                        style={{background:'#1e1e1e',color:'#ddd',border:'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:12,width:80,outline:'none',fontFamily:'inherit'}}/>
+                    </td>
                     <td style={{padding:'6px 8px'}}>
                       <input value={fmtPriceAdmin(s.price,db[adminMkt]?.currency)} onChange={e=>updateRow(i,'price',e.target.value)}
-                        style={{background:'#1e1e1e',color:'#e0e0e0',border:'1px solid #2a2a2a',borderRadius:3,padding:'4px 7px',fontSize:12,width:120,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
+                        placeholder={needsPrice?'⚠ set price':''}
+                        style={{background:'#1e1e1e',color:needsPrice?'#f5a623':'#e0e0e0',border:needsPrice?'1px solid #6a4a00':'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:12,width:120,textAlign:'right',outline:'none',fontFamily:'inherit'}}/>
                     </td>
                     <td style={{padding:'6px 8px'}}>
                       <input value={s.note||''} onChange={e=>updateRow(i,'note',e.target.value)}
-                        style={{background:'#1e1e1e',color:'#888',border:'1px solid #2a2a2a',borderRadius:3,padding:'4px 7px',fontSize:11,width:'100%',outline:'none',fontFamily:'inherit'}}/>
+                        style={{background:'#1e1e1e',color:'#888',border:'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:11,width:220,outline:'none',fontFamily:'inherit'}}/>
+                    </td>
+                    <td style={{padding:'6px 8px'}}>
+                      <input value={s.internalNotes||''} onChange={e=>updateRow(i,'internalNotes',e.target.value)}
+                        placeholder="e.g. scales with monthly volume above 5"
+                        style={{background:'#1e1e1e',color:'#a0d0f0',border:'1px solid #2a2a2a',borderRadius:3,padding:'5px 8px',fontSize:11,width:240,outline:'none',fontFamily:'inherit'}}/>
                     </td>
                     <td style={{padding:'6px 8px'}}><button style={bRd} onClick={()=>deleteRow(i)}>✕</button></td>
                   </tr>
-                ))}</tbody>
+                )})}</tbody>
               </table>
-            </div>
+            </div>}
             <div style={{marginTop:20,background:'#161616',padding:18,borderRadius:8,border:'1px solid #222'}}>
-              <div style={{fontWeight:600,fontSize:13,color:'#D4AF37',marginBottom:14}}>+ Add New Service</div>
-              <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr 1fr 1fr 2fr',gap:10,marginBottom:10}}>
-                {[['name','Service Name'],['cat','Category'],['sub','Sub'],['unit','Unit'],['price',`Price (${db[adminMkt]?.currency})`]].map(([k,l])=>(
+              <div style={{fontWeight:600,fontSize:13,color:'#D4AF37',marginBottom:14}}>+ Add New Service to {adminCat}</div>
+              <div style={{display:'grid',gridTemplateColumns:'2fr 1fr 1fr 1fr',gap:10,marginBottom:10}}>
+                {[['name','Service Name'],['sub','Sub'],['unit','Unit'],['price',`Price (${db[adminMkt]?.currency})`]].map(([k,l])=>(
                   <div key={k}><label style={{...S.lbl,marginBottom:3}}>{l}</label>
                     <input value={newSvc[k]} onChange={e=>setNewSvc(s=>({...s,[k]:e.target.value}))}
                       style={{background:'#1a1a1a',color:'#e0e0e0',border:'1px solid #2e2e2e',borderRadius:4,padding:'6px 8px',fontSize:12,width:'100%',outline:'none',fontFamily:'inherit'}}/>
                   </div>
                 ))}
-                <div><label style={{...S.lbl,marginBottom:3}}>Note</label>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
+                <div><label style={{...S.lbl,marginBottom:3}}>Client-facing note</label>
                   <input value={newSvc.note} onChange={e=>setNewSvc(s=>({...s,note:e.target.value}))}
                     style={{background:'#1a1a1a',color:'#e0e0e0',border:'1px solid #2e2e2e',borderRadius:4,padding:'6px 8px',fontSize:12,width:'100%',outline:'none',fontFamily:'inherit'}}/>
                 </div>
+                <div><label style={{...S.lbl,marginBottom:3}}>Internal notes (AI context only)</label>
+                  <input value={newSvc.internalNotes} onChange={e=>setNewSvc(s=>({...s,internalNotes:e.target.value}))}
+                    style={{background:'#1a1a1a',color:'#a0d0f0',border:'1px solid #2e2e2e',borderRadius:4,padding:'6px 8px',fontSize:12,width:'100%',outline:'none',fontFamily:'inherit'}}/>
+                </div>
               </div>
-              <button style={bP} onClick={addService}>+ Add Service</button>
-              <div style={{marginTop:8,fontSize:11,color:'#666'}}>Click "Save Changes" after adding to persist.</div>
+              <button style={bP} onClick={()=>{setNewSvc(s=>({...s,cat:adminCat}));addService()}}>+ Add Service</button>
+              <div style={{marginTop:8,fontSize:11,color:'#666'}}>Click "Save Changes" after adding to persist. New service is added to the {adminCat} category for {db[adminMkt]?.label}.</div>
             </div>
           </>}
 
@@ -583,8 +748,10 @@ RETURN VALID JSON ONLY:
 
           {/* Log */}
           {adminTab==='log'&&<>
-            <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16}}>
-              <div style={{fontSize:13,color:'#888'}}>{log.length} quotation{log.length!==1?'s':''} in log</div>
+            <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:16,flexWrap:'wrap'}}>
+              <div style={{fontSize:13,color:'#888'}}>{filteredLog.length} of {log.length} quotation{log.length!==1?'s':''}</div>
+              <input placeholder="Search client, quote #, preparer…" value={logSearch} onChange={e=>setLogSearch(e.target.value)}
+                style={{background:'#1a1a1a',color:'#e0e0e0',border:'1px solid #2e2e2e',borderRadius:4,padding:'6px 10px',fontSize:12,minWidth:220,outline:'none',fontFamily:'inherit'}}/>
               <button style={bRd} onClick={()=>{if(confirm('Clear all log entries?')){setLog([]);try{localStorage.removeItem(LOG_KEY)}catch{}}}}>Clear Log</button>
               <button style={bG} onClick={()=>{
                 const csv=['Quote No,Client,Customer ID,Prepared By,Markets,Currency,Total,Created At']
@@ -593,13 +760,13 @@ RETURN VALID JSON ONLY:
                 const bl=new Blob([csv],{type:'text/csv'});const u=URL.createObjectURL(bl);const a=document.createElement('a');a.href=u;a.download='c2-quotation-log.csv';a.click();URL.revokeObjectURL(u)
               }}>⬇ Export CSV</button>
             </div>
-            {log.length===0
-              ?<div style={{color:'#666',fontSize:13}}>No quotations generated yet.</div>
+            {filteredLog.length===0
+              ?<div style={{color:'#666',fontSize:13}}>{log.length===0?'No quotations generated yet.':'No quotations match your search.'}</div>
               :<table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                 <thead><tr style={{background:'#111'}}>{['Quote #','Client','Prepared By','Markets','Currency','Total','Created At',''].map(h=>(
                   <th key={h} style={{padding:'8px 10px',textAlign:'left',color:'#888',fontWeight:600,borderBottom:'1px solid #222',whiteSpace:'nowrap'}}>{h}</th>
                 ))}</tr></thead>
-                <tbody>{log.map((e,i)=>(
+                <tbody>{filteredLog.map((e,i)=>(
                   <tr key={e.id} style={{background:i%2===0?'#0f0f0f':'#131313',borderBottom:'1px solid #1a1a1a'}}>
                     <td style={{padding:'8px 10px',color:'#D4AF37',fontFamily:'monospace',fontSize:11}}>{e.quoteNo}</td>
                     <td style={{padding:'8px 10px',color:'#ddd',fontWeight:500}}>{e.clientName}</td>
@@ -608,9 +775,12 @@ RETURN VALID JSON ONLY:
                     <td style={{padding:'8px 10px',color:'#888'}}>{e.currency}</td>
                     <td style={{padding:'8px 10px',color:'#ccc',fontWeight:600}}>{(e.total||0).toLocaleString(e.currency==='IDR'?'id-ID':'en-US')}</td>
                     <td style={{padding:'8px 10px',color:'#666',fontSize:11,whiteSpace:'nowrap'}}>{fmtDateTime(e.createdAt)}</td>
-                    <td style={{padding:'8px 10px'}}>
+                    <td style={{padding:'8px 10px',whiteSpace:'nowrap'}}>
                       {e.quotData
-                        ?<button style={{...bBl,padding:'5px 12px',fontSize:11}} onClick={()=>setViewingLog(e)}>View / Download</button>
+                        ?<>
+                          <button style={{...bOr,padding:'5px 10px',fontSize:11,marginRight:6}} onClick={()=>loadFromLog(e)}>✏️ Load & Edit</button>
+                          <button style={{...bBl,padding:'5px 12px',fontSize:11}} onClick={()=>setViewingLog(e)}>View / Download</button>
+                        </>
                         :<span style={{fontSize:11,color:'#555'}}>No data</span>}
                     </td>
                   </tr>
@@ -628,6 +798,7 @@ RETURN VALID JSON ONLY:
         <div style={{fontWeight:700,color:'#D4AF37',fontFamily:'monospace'}}>{viewingLog.quoteNo}</div>
         <div style={{color:'#888',fontSize:13}}>{viewingLog.clientName} — {fmtDateTime(viewingLog.createdAt)}</div>
         <div style={{marginLeft:'auto',display:'flex',gap:10}}>
+          <button style={bOr} onClick={()=>loadFromLog(viewingLog)}>✏️ Load & Edit</button>
           <button style={bBl} onClick={exportLogPDF} disabled={logPdfBusy}>{logPdfBusy?'⏳ Generating…':'⬇ Download PDF'}</button>
           <button style={bGr} onClick={exportLogExcel}>⬇ Download Excel</button>
           <button style={bG} onClick={()=>setViewingLog(null)}>✕ Close</button>
@@ -642,7 +813,7 @@ RETURN VALID JSON ONLY:
           period={viewingLog.period}
           date={viewingLog.date}
           quoteNo={viewingLog.quoteNo}
-          prep={{name:viewingLog.preparedBy,title:viewingLog.prepTitle}}
+          preps={viewingLog.signers&&viewingLog.signers.length?viewingLog.signers:[{name:viewingLog.preparedBy,title:viewingLog.prepTitle}]}
           editMode={false}
           onPDF={exportLogPDF}
           onExcel={exportLogExcel}
@@ -657,8 +828,10 @@ RETURN VALID JSON ONLY:
 
 // ── Quotation Document ────────────────────────────────────────────────────────
 const QuotationDoc=forwardRef(function QuotationDoc({
-  quot,clientName,custId,period,date,quoteNo,prep,
-  editMode,onToggleEdit,onUpdateItem,onDeleteItem,onAddItem,onSaveRevision,
+  quot,clientName,custId,period,date,quoteNo,preps,
+  editMode,onToggleEdit,onUpdateItem,onDeleteItem,onAddItem,
+  onUpdatePaymentTerms,onUpdateNote,onAddNote,onDeleteNote,
+  onSaveRevision,
   onPDF,onExcel,onPrint,pdfBusy,hideToolbar
 },ref){
   const cur=quot.currency
@@ -667,6 +840,7 @@ const QuotationDoc=forwardRef(function QuotationDoc({
     if(it.category!==lastCat){grouped.push({type:'hdr',label:it.category});lastCat=it.category}
     grouped.push({type:'row',...it,_idx:i})
   })
+  const signers=preps&&preps.length?preps:[{name:'Tommy Prayoga',title:'Head of Agency'}]
 
   // Inline input style
   const iS={background:'#f9f9e8',border:'1px solid #ccc',borderRadius:3,padding:'3px 6px',fontSize:11,outline:'none',fontFamily:'Arial,Helvetica,sans-serif',width:'100%',boxSizing:'border-box'}
@@ -790,19 +964,34 @@ const QuotationDoc=forwardRef(function QuotationDoc({
       {/* Notes */}
       <div style={{marginTop:26,lineHeight:1.75,color:'#444',fontSize:11}}>
         <div>*C2 will begin the project after client has paid <strong>{quot.dpPct}%</strong> of the total fee as down payment.</div>
-        <div>*{quot.paymentTerms}</div>
-        {(quot.notes||[]).map((n,i)=><div key={i}>*{n}</div>)}
-        {cur==='IDR'&&<div>*A 2% charge will apply for late payments.</div>}
-        {cur==='USD'&&<div>*Price excludes Indonesian Corporate Income Tax. Gross amount invoiced: {fmt(Math.round(quot.grand),cur)}.</div>}
+        {editMode
+          ?<div style={{display:'flex',alignItems:'center',gap:6,margin:'5px 0'}}>
+             <span>*</span><input value={quot.paymentTerms||''} onChange={e=>onUpdatePaymentTerms(e.target.value)} style={{...iS,flex:1}}/>
+           </div>
+          :<div>*{quot.paymentTerms}</div>}
+        {(quot.notes||[]).map((n,i)=>editMode
+          ?<div key={i} style={{display:'flex',alignItems:'center',gap:6,margin:'5px 0'}}>
+             <span>*</span><input value={n} onChange={e=>onUpdateNote(i,e.target.value)} style={{...iS,flex:1}}/>
+             <button onClick={()=>onDeleteNote(i)} style={{cursor:'pointer',background:'#fee',border:'1px solid #fcc',borderRadius:3,color:'#c00',fontSize:11,padding:'2px 6px',fontFamily:'inherit'}}>✕</button>
+           </div>
+          :<div key={i}>*{n}</div>
+        )}
+        {editMode&&<button onClick={onAddNote} style={{...bG,padding:'4px 10px',fontSize:11,marginTop:2}}>+ Add Note</button>}
+        {cur==='IDR'&&<div style={{marginTop:5}}>*A 2% charge will apply for late payments.</div>}
+        {cur==='USD'&&<div style={{marginTop:5}}>*Price excludes Indonesian Corporate Income Tax. Gross amount invoiced: {fmt(Math.round(quot.grand),cur)}.</div>}
       </div>
 
-      {/* Signature */}
-      <div style={{marginTop:44}}>
-        <div style={{fontWeight:600,marginBottom:44,color:'#333'}}>Quotation Prepared By:</div>
-        <div style={{fontWeight:700,fontSize:13}}>{prep?.name||'Tommy Prayoga'}</div>
-        <div style={{color:'#444'}}>{prep?.title||'Head of Agency'}</div>
-        <div style={{color:'#444'}}>PT Konten Global Adikarya (C2)</div>
-        <div style={{color:'#888',marginTop:4,fontSize:11}}>{fmtDate(date)}</div>
+      {/* Signature(s) */}
+      <div style={{marginTop:44,display:'flex',gap:56,flexWrap:'wrap'}}>
+        {signers.map((p,i)=>(
+          <div key={i}>
+            <div style={{fontWeight:600,marginBottom:44,color:'#333'}}>Quotation Prepared By:</div>
+            <div style={{fontWeight:700,fontSize:13}}>{p?.name||'Tommy Prayoga'}</div>
+            <div style={{color:'#444'}}>{p?.title||'Head of Agency'}</div>
+            <div style={{color:'#444'}}>PT Konten Global Adikarya (C2)</div>
+            <div style={{color:'#888',marginTop:4,fontSize:11}}>{fmtDate(date)}</div>
+          </div>
+        ))}
       </div>
       <div style={{marginTop:36,borderTop:'1px solid #e0e0e0',paddingTop:12,fontSize:10,color:'#bbb',textAlign:'center'}}>
         CONFIDENTIAL — PT KONTEN GLOBAL ADIKARYA (C2) — young@contentcollision.co
